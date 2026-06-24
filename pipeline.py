@@ -14,9 +14,20 @@ import sys, os, json, time, ssl, urllib.request, urllib.error
 
 # ------------------------------------------------------------
 # 加载 .env（不依赖 python-dotenv）
+# 按优先级查找：脚本目录 > 当前工作目录 > ~/.claude/skills/code-pipeline
 # ------------------------------------------------------------
-_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_ENV_PATH):
+_CANDIDATE_ENV_PATHS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    os.path.join(os.getcwd(), ".env"),
+    os.path.join(os.path.expanduser("~"), ".claude", "skills", "code-pipeline", ".env"),
+]
+_ENV_PATH = None
+for _p in _CANDIDATE_ENV_PATHS:
+    if os.path.exists(_p):
+        _ENV_PATH = _p
+        break
+
+if _ENV_PATH:
     with open(_ENV_PATH, "r", encoding="utf-8") as _f:
         for _line in _f:
             _line = _line.strip()
