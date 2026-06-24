@@ -10,6 +10,7 @@ import sys
 import os
 import time
 import threading
+import traceback
 
 # 把脚本所在目录加入路径，以便 import pipeline
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -110,7 +111,7 @@ def main():
         try:
             result["value"] = pipeline.run(question, callback=callback, verbose=False)
         except Exception as e:
-            result["error"] = str(e)
+            result["error"] = f"{e}\n\n{traceback.format_exc()}"
 
     layout = make_layout(question)
     thread = threading.Thread(target=worker, daemon=True)
@@ -131,16 +132,23 @@ def main():
 
         if result.get("value"):
             res = result["value"]
-            code = res.get("code", "")
-            # 展示最终代码
-            syntax = Syntax(code, "python", theme="monokai", line_numbers=True, word_wrap=True)
-            layout["main"].update(Panel(syntax, title="最终代码", border_style="green"))
-            paths = "\n".join(f"[dim]{p}[/dim]" for p in res.get("paths", []))
-            layout["footer"].update(Panel(
-                f"[bold green]✅ 完成[/bold green]  耗时 {res.get('elapsed', round(elapsed, 1))}s\n"
-                f"[dim]中间文件:[/dim]\n{paths}",
-                border_style="green"
-            ))
+            if "error" in res:
+                # pipeline 返回了失败信息
+                step = res.get("step", "?")
+                err = res["error"]
+                layout["main"].update(Panel(f"[red]Step {step} 失败:\n{err}[/red]", title="错误", border_style="red"))
+                layout["footer"].update(Panel("[red]运行失败[/red]", border_style="red"))
+            else:
+                code = res.get("code", "")
+                # 展示最终代码
+                syntax = Syntax(code, "python", theme="monokai", line_numbers=True, word_wrap=True)
+                layout["main"].update(Panel(syntax, title="最终代码", border_style="green"))
+                paths = "\n".join(f"[dim]{p}[/dim]" for p in res.get("paths", []))
+                layout["footer"].update(Panel(
+                    f"[bold green]✅ 完成[/bold green]  耗时 {res.get('elapsed', round(elapsed, 1))}s\n"
+                    f"[dim]中间文件:[/dim]\n{paths}",
+                    border_style="green"
+                ))
         else:
             err = result.get("error", "未知错误")
             layout["main"].update(Panel(f"[red]{err}[/red]", title="错误", border_style="red"))

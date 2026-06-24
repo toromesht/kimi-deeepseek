@@ -39,6 +39,54 @@ if _ENV_PATH:
             if _k and _k not in os.environ:
                 os.environ[_k] = _v
 
+# ------------------------------------------------------------
+# 自动读取问题中引用的本地文件
+# ------------------------------------------------------------
+import re
+
+_FILE_PATH_RE = re.compile(r'["\']([a-zA-Z]:\\[^"\']+)["\']|([a-zA-Z]:\\\S+)', re.IGNORECASE)
+
+
+def _extract_file_paths(text):
+    """从文本中提取 Windows 绝对路径"""
+    paths = []
+    for m in _FILE_PATH_RE.finditer(text):
+        p = m.group(1) or m.group(2)
+        if p and os.path.isfile(p):
+            paths.append(p)
+    return list(dict.fromkeys(paths))  # 去重
+
+
+def _load_file_content(path, max_bytes=500_000):
+    """读取文本文件，带编码回退"""
+    try:
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            return f"[文件过大 {size} bytes，仅读取前 {max_bytes} bytes]\n"
+        encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin1"]
+        for enc in encodings:
+            try:
+                with open(path, "r", encoding=enc, errors="replace") as f:
+                    content = f.read(max_bytes)
+                return content
+            except UnicodeDecodeError:
+                continue
+        return "[无法解码文件内容]"
+    except Exception as e:
+        return f"[读取文件失败: {e}]"
+
+
+def attach_files(q):
+    """如果问题中包含文件路径，把文件内容附加到问题里"""
+    paths = _extract_file_paths(q)
+    if not paths:
+        return q
+    parts = [q, "\n\n--- 附件文件内容 ---\n"]
+    for p in paths:
+        parts.append(f"\n### {p}\n```\n{_load_file_content(p)}\n```\n")
+    return "".join(parts)
+
+
 CFG = {
     "kimi": {
         "url": os.environ.get("KIMI_BASE", "https://api.moonshot.cn/v1") + "/chat/completions",
@@ -116,6 +164,7 @@ def run(q, callback=None, verbose=True):
     """
     t0 = time.time()
     paths = []
+    q = attach_files(q)
     if verbose:
         print(f"\n{'#' * 55}\n  Q: {q[:120]}{'...' if len(q) > 120 else ''}\n{'#' * 55}")
 
@@ -127,7 +176,7 @@ def run(q, callback=None, verbose=True):
     if not r1:
         if verbose: print(f"FAIL1: {u1}")
         _notify(callback, 1, "fail", {"error": u1})
-        return None
+        return {"error": f"Step 1 (Kimi prompt) failed: {u1}", "step": 1}
     if verbose:
         print(f"\n--- STEP1 Kimi->提示词 [{len(r1)}c, {u1.get('completion_tokens', '?')}t] ---")
         print(r1[:400] + ("..." if len(r1) > 400 else ""))
@@ -145,7 +194,7 @@ def run(q, callback=None, verbose=True):
     if not r2:
         if verbose: print(f"FAIL2: {u2}")
         _notify(callback, 2, "fail", {"error": u2})
-        return None
+        return {"error": f"Step 2 (KimiCode framework) failed: {u2}", "step": 2}
     if verbose:
         print(f"\n--- STEP2 KimiCode->框架 [{len(r2)}c, {u2.get('completion_tokens', '?')}t] ---")
         print(r2[:400] + ("..." if len(r2) > 400 else ""))
@@ -165,7 +214,7 @@ def run(q, callback=None, verbose=True):
     if not r3:
         if verbose: print(f"FAIL3: {u3}")
         _notify(callback, 3, "fail", {"error": u3})
-        return None
+        return {"error": f"Step 3 (DeepSeek code) failed: {u3}", "step": 3}
     if verbose:
         print(f"\n--- STEP3 DeepSeek->代码 [{len(r3)}c, {u3.get('completion_tokens', '?')}t] ---")
         print(r3[:400] + ("..." if len(r3) > 400 else ""))
@@ -188,7 +237,7 @@ def run(q, callback=None, verbose=True):
     if not r4:
         if verbose: print(f"FAIL4: {u4}")
         _notify(callback, 4, "fail", {"error": u4})
-        return None
+        return {"error": f"Step 4 (KimiCode review) failed: {u4}", "step": 4}
     if verbose:
         print(f"\n--- STEP4 KimiCode->检验+批判+修理 [{len(r4)}c, {u4.get('completion_tokens', '?')}t] ---")
         print(r4[:500] + ("..." if len(r4) > 500 else ""))
@@ -209,7 +258,7 @@ def run(q, callback=None, verbose=True):
     if not r5:
         if verbose: print(f"FAIL5: {u5}")
         _notify(callback, 5, "fail", {"error": u5})
-        return None
+        return {"error": f"Step 5 (DeepSeek final) failed: {u5}", "step": 5}
     if verbose:
         print(f"\n--- STEP5 DeepSeek->复查终版 [{len(r5)}c, {u5.get('completion_tokens', '?')}t] ---")
         print(r5[:500] + ("..." if len(r5) > 500 else ""))
