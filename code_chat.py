@@ -1,80 +1,61 @@
 #!/usr/bin/env python3
 """
-Kimi-DeepSeek 多模型代码流水线 —— 终端对话框版
+Kimi-DeepSeek 多模型代码流水线 —— 终端对话框版（Claude Code 风格）
 
 用法:
   python code_chat.py
+  kchat
 
 操作:
   - 底部输入框输入问题，按 Enter 发送
   - 支持粘贴文件路径，会自动读取文件内容
-  - 多轮对话会保留上下文
+  - 多轮对话保留上下文
+  - Ctrl+L 清空，Ctrl+C 退出，Ctrl+S 保存对话
 """
 import sys
 import os
 import time
+import json
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, Horizontal
-from textual.widgets import Header, Footer, Input, Button, Static
+from textual.containers import Horizontal
+from textual.widgets import Header, Footer, Input, Static, RichLog
 from textual import work
 from rich.syntax import Syntax
 from rich.markdown import Markdown
-from rich.panel import Panel
 from rich.text import Text
+from rich.rule import Rule
 
 import pipeline
 
 
-class Message(Static):
-    """单条消息组件"""
-
-    def __init__(self, role: str, content: str, is_code: bool = False, **kwargs):
-        self._role = role
-        self._content = content
-        self._is_code = is_code
-        super().__init__(**kwargs)
-
-    def compose(self) -> ComposeResult:
-        if self._role == "user":
-            header = Text("你", style="bold cyan")
-            body = Text(self._content)
-            panel = Panel(body, title=header, border_style="cyan")
-        elif self._role == "assistant":
-            header = Text("Kimi-DeepSeek", style="bold green")
-            if self._is_code:
-                body = Syntax(self._content, "python", theme="monokai", line_numbers=True, word_wrap=True)
-            else:
-                body = Markdown(self._content)
-            panel = Panel(body, title=header, border_style="green")
-        elif self._role == "system":
-            header = Text("系统", style="bold yellow")
-            panel = Panel(Text(self._content), title=header, border_style="yellow")
-        else:
-            header = Text(self._role, style="bold")
-            panel = Panel(Text(self._content), title=header)
-        yield Static(panel)
+HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history")
 
 
 class CodeChatApp(App):
-    """终端对话框应用"""
+    """Claude Code 风格终端对话框"""
 
     CSS = """
     Screen { align: center middle; }
 
-    #chat-container {
-        width: 100%;
-        height: 100%;
-        border: solid $primary;
-    }
-
     #chat-log {
         width: 100%;
         height: 1fr;
-        overflow-y: auto;
-        padding: 1 2;
+        padding: 0 2;
+        border: none;
+        background: $surface-darken-1;
+    }
+
+    #status-bar {
+        width: 100%;
+        height: 1;
+        content-align: left middle;
+        padding: 0 2;
+        color: $text-muted;
+        background: $surface;
     }
 
     #input-row {
@@ -82,25 +63,33 @@ class CodeChatApp(App):
         height: auto;
         dock: bottom;
         padding: 1 2;
+        background: $surface;
     }
 
     #msg-input {
         width: 1fr;
     }
 
-    #send-btn {
-        width: auto;
-        margin-left: 1;
+    .user-label {
+        color: cyan;
+        text-style: bold;
     }
 
-    .message {
-        margin-bottom: 1;
+    .assistant-label {
+        color: green;
+        text-style: bold;
+    }
+
+    .system-label {
+        color: yellow;
+        text-style: bold;
     }
     """
 
     BINDINGS = [
         ("ctrl+c", "quit", "退出"),
-        ("ctrl+l", "clear", "清空对话"),
+        ("ctrl+l", "clear", "清空"),
+        ("ctrl+s", "save", "保存"),
     ]
 
     def __init__(self, **kwargs):
@@ -109,98 +98,129 @@ class CodeChatApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Vertical(id="chat-container"):
-            yield Vertical(id="chat-log")
-            with Horizontal(id="input-row"):
-                yield Input(placeholder="输入问题，支持粘贴文件路径...", id="msg-input")
-                yield Button("发送", id="send-btn", variant="primary")
+        yield RichLog(id="chat-log", wrap=True, highlight=False, markup=False)
+        yield Static("就绪 | Kimi → KimiCode → DeepSeek → KimiCode → DeepSeek", id="status-bar")
+        with Horizontal(id="input-row"):
+            yield Input(placeholder="输入问题，支持粘贴文件路径...", id="msg-input")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.add_system_message(
-            "欢迎使用 Kimi-DeepSeek 代码流水线对话框。\n"
-            "输入问题后我会调用 Kimi → KimiCode → DeepSeek → KimiCode(批判修复) → DeepSeek(终版) 生成代码。\n"
-            "快捷键: Ctrl+C 退出 | Ctrl+L 清空"
-        )
         self.query_one("#msg-input", Input).focus()
+        self._print_welcome()
 
-    def add_message(self, role: str, content: str, is_code: bool = False) -> None:
-        log = self.query_one("#chat-log", Vertical)
-        msg = Message(role, content, is_code= is_code, classes="message")
-        log.mount(msg)
-        self.call_after_refresh(log.scroll_end, animate=False)
+    def _print_welcome(self):
+        log = self.query_one("#chat-log", RichLog)
+        log.write("")
+        log.write(Text("Kimi-DeepSeek 代码助手", style="bold bright_white"))
+        log.write(Text("输入问题生成代码，支持粘贴文件路径自动读取。Ctrl+S 保存对话，Ctrl+L 清空。", style="dim"))
+        log.write("")
 
-    def add_system_message(self, content: str) -> None:
-        self.add_message("system", content)
+    def _set_status(self, text: str):
+        self.query_one("#status-bar", Static).update(text)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "send-btn":
-            self.send_message()
+    def _add_message(self, role: str, content: str, is_code: bool = False):
+        log = self.query_one("#chat-log", RichLog)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        if role == "user":
+            label = Text(f"[{timestamp}] 你", style="bold cyan")
+            log.write(label)
+            log.write(Text(content))
+        elif role == "assistant":
+            label = Text(f"[{timestamp}] Kimi-DeepSeek", style="bold green")
+            log.write(label)
+            if is_code:
+                # 自动检测语言，默认 python
+                lang = self._detect_language(content)
+                log.write(Syntax(content, lang, theme="monokai", line_numbers=True, word_wrap=True))
+            else:
+                log.write(Markdown(content))
+        elif role == "system":
+            label = Text(f"[{timestamp}] 系统", style="bold yellow")
+            log.write(label)
+            log.write(Text(content, style="dim"))
+
+        log.write("")
+
+    def _detect_language(self, code: str) -> str:
+        if code.strip().startswith("<") and ">" in code:
+            return "html"
+        if "function" in code and "{" in code and "console.log" in code:
+            return "javascript"
+        if "package main" in code or "func " in code:
+            return "go"
+        if "fn " in code or "let " in code:
+            return "rust"
+        return "python"
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.send_message()
+        self._send_message()
 
-    def send_message(self) -> None:
+    def _send_message(self) -> None:
         input_widget = self.query_one("#msg-input", Input)
         text = input_widget.value.strip()
         if not text:
             return
         input_widget.value = ""
         input_widget.disabled = True
-        self.query_one("#send-btn", Button).disabled = True
 
-        self.history.append({"role": "user", "content": text})
-        self.add_message("user", text)
+        self.history.append({"role": "user", "content": text, "time": time.time()})
+        self._add_message("user", text)
+        self._set_status("思考中...")
         self.run_pipeline(text)
 
     @work(exclusive=True)
     async def run_pipeline(self, question: str) -> None:
         try:
-            # 先显示思考中
-            self.call_from_thread(self.add_system_message, "🤔 正在调用多模型流水线，请稍候...")
-
             t0 = time.time()
             result = pipeline.run(question, verbose=False)
             elapsed = time.time() - t0
 
             if result is None:
-                self.call_from_thread(self.add_system_message, "流水线返回空结果")
+                self.call_from_thread(self._on_error, "流水线返回空结果")
             elif "error" in result:
-                self.call_from_thread(
-                    self.add_system_message,
-                    f"❌ 流水线失败 (Step {result.get('step', '?')}): {result['error']}"
-                )
+                self.call_from_thread(self._on_error, f"Step {result.get('step', '?')} 失败: {result['error']}")
             else:
                 code = result.get("code", "")
                 paths = result.get("paths", [])
-                self.history.append({"role": "assistant", "content": code})
-                self.call_from_thread(self.add_message, "assistant", code, is_code=True)
+                self.history.append({"role": "assistant", "content": code, "time": time.time()})
+                self.call_from_thread(self._add_message, "assistant", code, True)
                 if paths:
-                    files = "\n".join(f"- {p}" for p in paths)
-                    self.call_from_thread(
-                        self.add_system_message,
-                        f"✅ 完成，耗时 {elapsed:.1f}s\n中间文件:\n{files}"
-                    )
+                    files = "  ".join(os.path.basename(p) for p in paths)
+                    self.call_from_thread(self._set_status, f"完成 {elapsed:.1f}s | {files}")
+                else:
+                    self.call_from_thread(self._set_status, f"完成 {elapsed:.1f}s")
         except Exception as e:
             import traceback
             err = f"{e}\n\n{traceback.format_exc()}"
-            self.call_from_thread(self.add_system_message, f"❌ 运行异常:\n{err}")
+            self.call_from_thread(self._on_error, err)
         finally:
-            def enable_input():
+            def enable():
                 self.query_one("#msg-input", Input).disabled = False
-                self.query_one("#send-btn", Button).disabled = False
                 self.query_one("#msg-input", Input).focus()
-            self.call_from_thread(enable_input)
+            self.call_from_thread(enable)
+
+    def _on_error(self, err: str):
+        self._add_message("system", f"❌ {err}")
+        self._set_status("运行失败")
 
     def action_clear(self) -> None:
-        log = self.query_one("#chat-log", Vertical)
-        log.remove_children()
+        log = self.query_one("#chat-log", RichLog)
+        log.clear()
         self.history.clear()
-        self.add_system_message("对话已清空。")
+        self._print_welcome()
+        self._set_status("对话已清空")
+
+    def action_save(self) -> None:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(HISTORY_DIR, f"chat_{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, ensure_ascii=False, indent=2)
+        self._add_message("system", f"对话已保存: {path}")
 
 
 if __name__ == "__main__":
-    # 检查 key
     missing = []
     for k, svc in [("KIMI_KEY", "kimi"), ("KIMI_CODE_KEY", "kimi_code"), ("DEEPSEEK_KEY", "deepseek")]:
         if not pipeline.CFG[svc]["key"]:
