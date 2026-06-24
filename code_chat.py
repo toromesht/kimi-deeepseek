@@ -169,8 +169,8 @@ class CodeChatApp(App):
         self._set_status("思考中...")
         self.run_pipeline(text)
 
-    @work(exclusive=True)
-    async def run_pipeline(self, question: str) -> None:
+    @work(exclusive=True, thread=True)
+    def run_pipeline(self, question: str) -> None:
         try:
             t0 = time.time()
             result = pipeline.run(question, verbose=False)

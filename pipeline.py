@@ -57,17 +57,17 @@ def _extract_file_paths(text):
     return list(dict.fromkeys(paths))  # 去重
 
 
-def _load_file_content(path, max_bytes=500_000):
-    """读取文本文件，带编码回退"""
+def _load_file_content(path, max_chars=4_000):
+    """读取文本文件，带编码回退。限制长度避免超出模型上下文。"""
     try:
         size = os.path.getsize(path)
-        if size > max_bytes:
-            return f"[文件过大 {size} bytes，仅读取前 {max_bytes} bytes]\n"
         encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin1"]
         for enc in encodings:
             try:
                 with open(path, "r", encoding=enc, errors="replace") as f:
-                    content = f.read(max_bytes)
+                    content = f.read(max_chars)
+                if len(content) >= max_chars:
+                    content = content[:max_chars] + f"\n\n[文件内容过长，已截断至前 {max_chars} 字符]"
                 return content
             except UnicodeDecodeError:
                 continue
