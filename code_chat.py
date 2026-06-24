@@ -1,169 +1,183 @@
 #!/usr/bin/env python3
 """
-Kimi-Code 终端对话框
+Kimi-DeepSeek 终端聊天（类 Claude Code 内联界面）
 
 用法:
   python code_chat.py
   kchat
+
+命令:
+  /quit        退出
+  /clear       清空屏幕和对话历史
+  /mode full   切换模式: full / fast / ultra
+  /history     显示当前历史轮数
 """
 import sys
 import os
 import time
-import json
-from datetime import datetime
+import threading
+from queue import Queue
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal
-from textual.widgets import Header, Footer, Input, Static, RichLog
-from textual import work
-from rich.syntax import Syntax
+from rich.console import Console
 from rich.markdown import Markdown
+from rich.syntax import Syntax
+from rich.panel import Panel
 from rich.text import Text
+from rich.rule import Rule
 
 import pipeline
+from pipeline import Pipeline, Mode
 
 
-class KimiCodeChat(App):
-    """简洁终端对话应用"""
+console = Console()
 
-    def __init__(self, **kwargs):
+
+class TerminalChat:
+    """内联终端聊天：消息滚动、底部输入、显示思考状态。"""
+
+    def __init__(self):
         self.history = []
-        super().__init__(**kwargs)
+        self.mode = pipeline.Config.PIPELINE_MODE
+        if self.mode not in ("full", "fast", "ultra"):
+            self.mode = "full"
 
-    CSS = """
-    Screen { align: center middle; }
+    def _detect_language(self, code: str) -> str:
+        code = code.strip()
+        if code.startswith("<") and ">" in code:
+            return "html"
+        if "package main" in code or ("func " in code and "func main" in code):
+            return "go"
+        if "function" in code and "{" in code:
+            return "javascript"
+        if "#include" in code or "int main(" in code:
+            return "cpp"
+        return "python"
 
-    #chat-log {
-        width: 100%;
-        height: 1fr;
-        padding: 0 1;
-        border: none;
-        background: $surface;
-    }
+    def _print_user(self, text: str):
+        console.print(Text(f"> {text}", style="bold cyan"))
 
-    #status-bar {
-        width: 100%;
-        height: 1;
-        content-align: left middle;
-        padding: 0 1;
-        color: $text-muted;
-        background: $surface;
-    }
+    def _print_ai(self, text: str):
+        lang = self._detect_language(text)
+        console.print(Panel(
+            Syntax(text, lang, theme="monokai", line_numbers=False, word_wrap=True),
+            border_style="green",
+            title="助手",
+            title_align="left"
+        ))
 
-    #input-row {
-        width: 100%;
-        height: auto;
-        dock: bottom;
-        padding: 0 1;
-        background: $surface;
-    }
+    def _print_system(self, text: str, style: str = "dim yellow"):
+        console.print(Text(text, style=style))
 
-    #msg-input {
-        width: 1fr;
-    }
-    """
-
-    BINDINGS = [
-        ("ctrl+c", "quit", "退出"),
-        ("ctrl+l", "clear", "清空"),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield RichLog(id="chat-log", wrap=True, highlight=False, markup=False)
-        yield Static("Kimi-Code 终端版 | 输入问题开始", id="status-bar")
-        with Horizontal(id="input-row"):
-            yield Input(placeholder="输入问题...", id="msg-input")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self.query_one("#msg-input", Input).focus()
-        self._log().write(Text("Kimi-Code 终端版已启动。输入问题生成代码。", style="dim"))
-        self._log().write("")
-
-    def _log(self) -> RichLog:
-        return self.query_one("#chat-log", RichLog)
-
-    def _status(self, text: str):
-        self.query_one("#status-bar", Static).update(text)
-
-    def _add_user(self, text: str):
-        self._log().write(Text(f"> {text}", style="cyan"))
-        self._log().write("")
-
-    def _add_ai(self, text: str):
-        # 简单语言检测
-        lang = "python"
-        if text.strip().startswith("<"):
-            lang = "html"
-        elif "function" in text and "{" in text:
-            lang = "javascript"
-        elif "package main" in text or "func " in text:
-            lang = "go"
-
-        self._log().write(Syntax(text, lang, theme="monokai", line_numbers=False, word_wrap=True))
-        self._log().write("")
-
-    def _add_system(self, text: str):
-        self._log().write(Text(text, style="dim yellow"))
-        self._log().write("")
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self._send()
-
-    def _send(self) -> None:
-        inp = self.query_one("#msg-input", Input)
-        text = inp.value.strip()
-        if not text:
-            return
-        inp.value = ""
-        inp.disabled = True
-
-        self.history.append({"role": "user", "content": text})
-        self._add_user(text)
-        self._status("思考中...")
-        self.run_pipeline(text)
-
-    @work(exclusive=True, thread=True)
-    def run_pipeline(self, question: str) -> None:
+    def _run_pipeline_thread(self, question: str, result_queue: Queue):
         try:
-            t0 = time.time()
-            result = pipeline.run(question, history=self.history, verbose=False)
-            elapsed = time.time() - t0
-
-            if result is None:
-                self.call_from_thread(self._add_system, "❌ 流水线返回空结果")
-            elif "error" in result:
-                self.call_from_thread(self._add_system, f"❌ {result['error']}")
-            else:
-                code = result.get("code", "")
-                self.history.append({"role": "assistant", "content": code})
-                self.call_from_thread(self._add_ai, code)
-                self.call_from_thread(self._status, f"完成 {elapsed:.1f}s")
+            p = Pipeline(mode=self.mode, callback=None, verbose=False)
+            result = p.run(question, history=self.history)
+            result_queue.put(("ok", result))
         except Exception as e:
             import traceback
-            self.call_from_thread(self._add_system, f"❌ {e}\n{traceback.format_exc()}")
-        finally:
-            def enable():
-                self.query_one("#msg-input", Input).disabled = False
-                self.query_one("#msg-input", Input).focus()
-            self.call_from_thread(enable)
+            result_queue.put(("error", f"{e}\n{traceback.format_exc()}"))
 
-    def action_clear(self) -> None:
-        self.history.clear()
-        self._log().clear()
-        self._log().write(Text("Kimi-Code 终端版已启动。输入问题生成代码。", style="dim"))
-        self._log().write("")
-        self._status("已清空")
+    def _thinking_label(self) -> str:
+        labels = {
+            "full": "● full  Planner → Coder → Critic → Validator → Repairer",
+            "fast": "● fast  DeepSeek Coder → DeepSeek Repairer",
+            "ultra": "● ultra DeepSeek CoT",
+        }
+        return labels.get(self.mode, f"● {self.mode}")
+
+    def _process_input(self, text: str) -> bool:
+        text = text.strip()
+        if not text:
+            return True
+
+        if text == "/quit" or text == "/exit":
+            return False
+
+        if text == "/clear":
+            console.clear()
+            self.history.clear()
+            self._print_system("屏幕与历史已清空。", style="dim")
+            return True
+
+        if text.startswith("/mode"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2 and parts[1] in ("full", "fast", "ultra"):
+                self.mode = parts[1]
+                self._print_system(f"模式切换为: {self.mode}", style="bold green")
+            else:
+                self._print_system("用法: /mode full|fast|ultra", style="yellow")
+            return True
+
+        if text == "/history":
+            self._print_system(f"当前历史轮数: {len(self.history) // 2}", style="dim")
+            return True
+
+        if text.startswith("/"):
+            self._print_system(f"未知命令: {text}", style="yellow")
+            return True
+
+        # 正常问题
+        self.history.append({"role": "user", "content": text})
+        self._print_user(text)
+
+        result_queue = Queue()
+        thread = threading.Thread(
+            target=self._run_pipeline_thread,
+            args=(text, result_queue),
+            daemon=True,
+        )
+
+        with console.status(
+            f"[bold green]{self._thinking_label()}[/]  正在思考...",
+            spinner="dots",
+            refresh_per_second=10,
+        ):
+            thread.start()
+            thread.join()
+
+        status, payload = result_queue.get()
+
+        if status == "error":
+            self._print_system(f"❌ {payload}", style="red")
+            return True
+
+        result = payload
+        if result.error:
+            self._print_system(f"❌ {result.error} (step: {result.step})", style="red")
+            return True
+
+        self._print_ai(result.code)
+        self.history.append({"role": "assistant", "content": result.code})
+        console.print(Text(f"✓ 完成 · {result.mode} · {result.elapsed}s", style="dim green"))
+        console.print()
+        return True
+
+    def run(self):
+        console.print(Rule("[bold cyan]Kimi-DeepSeek 终端聊天[/]", style="cyan"))
+        console.print(
+            "[dim]输入问题生成代码 · /mode full|fast|ultra · /clear · /quit[/dim]\n"
+        )
+
+        while True:
+            try:
+                question = console.input("[bold cyan]> [/]")
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
+
+            if not self._process_input(question):
+                break
+
+        console.print("[dim]再见。[/dim]")
 
 
 if __name__ == "__main__":
     missing = pipeline.check_missing_keys()
     if missing:
-        print(f"缺少环境变量: {', '.join(missing)}")
+        console.print(f"[red]缺少环境变量: {', '.join(missing)}[/red]")
+        console.print("[dim]请检查 .env 文件或环境变量。[/dim]")
         sys.exit(2)
 
-    app = KimiCodeChat()
-    app.run()
+    TerminalChat().run()
