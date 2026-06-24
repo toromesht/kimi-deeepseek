@@ -75,7 +75,31 @@ kcode "用 Rust 写一个 CLI 计时器"
 
 > 用 `kcode` 而不是 `code`，避免和 VS Code 的 `code` 命令冲突。
 
-### 5. 对话框版 `kchat`
+### 5. Web 网页版 `kweb`（最像 Kimi）
+
+启动 Web 服务器，浏览器打开 `http://127.0.0.1:5000`：
+
+```bash
+python web_chat.py
+```
+
+```powershell
+kweb    # PowerShell alias，新开窗口生效
+```
+
+```bash
+kweb    # Git Bash alias
+```
+
+特点：
+- 类似 Kimi 网页端的干净界面
+- 左侧边栏 + 中间对话
+- 消息气泡
+- 代码语法高亮
+- 实时显示流水线 5 步进度
+- 支持粘贴文件路径
+
+### 6. 终端对话框版 `kchat`
 
 类似 Kimi / Claude 的聊天界面，支持多轮对话：
 
