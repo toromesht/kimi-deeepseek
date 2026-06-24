@@ -160,10 +160,7 @@ class KimiCodeChat(App):
 
 
 if __name__ == "__main__":
-    missing = []
-    for k, svc in [("KIMI_KEY", "kimi"), ("KIMI_CODE_KEY", "kimi_code"), ("DEEPSEEK_KEY", "deepseek")]:
-        if not pipeline.CFG[svc]["key"]:
-            missing.append(k)
+    missing = pipeline.check_missing_keys()
     if missing:
         print(f"缺少环境变量: {', '.join(missing)}")
         sys.exit(2)

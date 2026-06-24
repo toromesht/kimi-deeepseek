@@ -92,10 +92,7 @@ def main():
         sys.exit(1)
 
     # 检查 key
-    missing = []
-    for k, svc in [("KIMI_KEY", "kimi"), ("KIMI_CODE_KEY", "kimi_code"), ("DEEPSEEK_KEY", "deepseek")]:
-        if not pipeline.CFG[svc]["key"]:
-            missing.append(k)
+    missing = pipeline.check_missing_keys()
     if missing:
         console.print(f"[red]缺少环境变量: {', '.join(missing)}[/red]")
         console.print("[dim]请检查 .env 文件或环境变量。[/dim]")
