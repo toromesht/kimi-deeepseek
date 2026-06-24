@@ -89,73 +89,129 @@ def save_round(step, text, out_dir="outputs"):
     return path
 
 
-def run(q):
+def _notify(cb, step, status, data=None):
+    if cb:
+        try:
+            cb(step, status, data or {})
+        except Exception:
+            pass
+
+
+def run(q, callback=None, verbose=True):
+    """
+    callback(step, status, data) 会在每步开始/完成/失败时被调用
+    step: 1~5, status: 'start'|'done'|'fail'
+    data: {'name','model','tokens','len','path','error',...}
+    """
     t0 = time.time()
-    print(f"\n{'#' * 55}\n  Q: {q[:120]}{'...' if len(q) > 120 else ''}\n{'#' * 55}")
+    paths = []
+    if verbose:
+        print(f"\n{'#' * 55}\n  Q: {q[:120]}{'...' if len(q) > 120 else ''}\n{'#' * 55}")
 
     # STEP 1: Kimi 写提示词
+    _notify(callback, 1, "start", {"name": "Kimi prompt", "model": CFG['kimi']['model']})
     r1, u1 = call("kimi",
         "你是 Prompt 工程师。根据用户问题，写给代码 AI 的详细提示词。"
         "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。", q)
     if not r1:
-        print(f"FAIL1: {u1}"); return None
-    print(f"\n--- STEP1 Kimi->提示词 [{len(r1)}c, {u1.get('completion_tokens', '?')}t] ---")
-    print(r1[:400] + ("..." if len(r1) > 400 else ""))
-    save_round("01_prompt", r1)
+        if verbose: print(f"FAIL1: {u1}")
+        _notify(callback, 1, "fail", {"error": u1})
+        return None
+    if verbose:
+        print(f"\n--- STEP1 Kimi->提示词 [{len(r1)}c, {u1.get('completion_tokens', '?')}t] ---")
+        print(r1[:400] + ("..." if len(r1) > 400 else ""))
+    paths.append(save_round("01_prompt", r1))
+    _notify(callback, 1, "done", {
+        "name": "Kimi prompt", "tokens": u1.get("completion_tokens", "?"),
+        "len": len(r1), "path": paths[-1]
+    })
 
     # STEP 2: KimiCode 写框架
+    _notify(callback, 2, "start", {"name": "KimiCode framework", "model": CFG['kimi_code']['model']})
     r2, u2 = call("kimi_code",
         "你是架构师。根据提示词写代码框架：模块划分、函数签名、伪代码、数据流。"
         "只写框架，不写具体实现。", r1)
     if not r2:
-        print(f"FAIL2: {u2}"); return None
-    print(f"\n--- STEP2 KimiCode->框架 [{len(r2)}c, {u2.get('completion_tokens', '?')}t] ---")
-    print(r2[:400] + ("..." if len(r2) > 400 else ""))
-    save_round("02_framework", r2)
+        if verbose: print(f"FAIL2: {u2}")
+        _notify(callback, 2, "fail", {"error": u2})
+        return None
+    if verbose:
+        print(f"\n--- STEP2 KimiCode->框架 [{len(r2)}c, {u2.get('completion_tokens', '?')}t] ---")
+        print(r2[:400] + ("..." if len(r2) > 400 else ""))
+    paths.append(save_round("02_framework", r2))
+    _notify(callback, 2, "done", {
+        "name": "KimiCode framework", "tokens": u2.get("completion_tokens", "?"),
+        "len": len(r2), "path": paths[-1]
+    })
 
     # STEP 3: DeepSeek 写代码
+    _notify(callback, 3, "start", {"name": "DeepSeek code", "model": CFG['deepseek']['model']})
     r3, u3 = call("deepseek",
         "你是编程专家。根据框架写完整可运行代码。要求："
         "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
         "4. 如果问题含测试要求，给出测试用例。", r2,
         max_tok=16384)
     if not r3:
-        print(f"FAIL3: {u3}"); return None
-    print(f"\n--- STEP3 DeepSeek->代码 [{len(r3)}c, {u3.get('completion_tokens', '?')}t] ---")
-    print(r3[:400] + ("..." if len(r3) > 400 else ""))
-    save_round("03_code", r3)
+        if verbose: print(f"FAIL3: {u3}")
+        _notify(callback, 3, "fail", {"error": u3})
+        return None
+    if verbose:
+        print(f"\n--- STEP3 DeepSeek->代码 [{len(r3)}c, {u3.get('completion_tokens', '?')}t] ---")
+        print(r3[:400] + ("..." if len(r3) > 400 else ""))
+    paths.append(save_round("03_code", r3))
+    _notify(callback, 3, "done", {
+        "name": "DeepSeek code", "tokens": u3.get("completion_tokens", "?"),
+        "len": len(r3), "path": paths[-1]
+    })
 
     # STEP 4: KimiCode 检验+批判+修理
+    _notify(callback, 4, "start", {"name": "KimiCode review", "model": CFG['kimi_code']['model']})
     r4, u4 = call("kimi_code",
-        "你是严格代码审查员，具备批判性思维。请对以下代码做：\n"
-        "1. 检验语法和逻辑是否完整正确；\n"
-        "2. 提出批判性质疑——对每个设计决策追问「为什么要这样做？」「有没有更好的方案？」"
-        "「如果输入极端值会怎样？」「这个假设在什么条件下不成立？」；\n"
-        "3. 直接修复发现的所有问题，输出修正后的完整代码。\n\n"
+        f"你是严格代码审查员，具备批判性思维。请对以下代码做：\n"
+        f"1. 检验语法和逻辑是否完整正确；\n"
+        f"2. 提出批判性质疑——对每个设计决策追问「为什么要这样做？」「有没有更好的方案？」"
+        f"「如果输入极端值会怎样？」「这个假设在什么条件下不成立？」；\n"
+        f"3. 直接修复发现的所有问题，输出修正后的完整代码。\n\n"
         f"原始需求：{q}\n\n待审查代码：\n{r3}",
         max_tok=8192)
     if not r4:
-        print(f"FAIL4: {u4}"); return None
-    print(f"\n--- STEP4 KimiCode->检验+批判+修理 [{len(r4)}c, {u4.get('completion_tokens', '?')}t] ---")
-    print(r4[:500] + ("..." if len(r4) > 500 else ""))
-    save_round("04_review", r4)
+        if verbose: print(f"FAIL4: {u4}")
+        _notify(callback, 4, "fail", {"error": u4})
+        return None
+    if verbose:
+        print(f"\n--- STEP4 KimiCode->检验+批判+修理 [{len(r4)}c, {u4.get('completion_tokens', '?')}t] ---")
+        print(r4[:500] + ("..." if len(r4) > 500 else ""))
+    paths.append(save_round("04_review", r4))
+    _notify(callback, 4, "done", {
+        "name": "KimiCode review", "tokens": u4.get("completion_tokens", "?"),
+        "len": len(r4), "path": paths[-1]
+    })
 
     # STEP 5: DeepSeek 复查批判意见，最终修改
+    _notify(callback, 5, "start", {"name": "DeepSeek final", "model": CFG['deepseek']['model']})
     r5, u5 = call("deepseek",
-        "代码审查员提出了批判性建议和修改。请你：\n"
-        "1. 逐条审视审查意见，判断哪些接受、哪些驳回（附理由）；\n"
-        "2. 综合所有合理建议，输出最终版完整代码。\n\n"
+        f"代码审查员提出了批判性建议和修改。请你：\n"
+        f"1. 逐条审视审查意见，判断哪些接受、哪些驳回（附理由）；\n"
+        f"2. 综合所有合理建议，输出最终版完整代码。\n\n"
         f"原始需求：{q}\n\n审查意见与修改：\n{r4}",
         max_tok=16384)
     if not r5:
-        print(f"FAIL5: {u5}"); return None
-    print(f"\n--- STEP5 DeepSeek->复查终版 [{len(r5)}c, {u5.get('completion_tokens', '?')}t] ---")
-    print(r5[:500] + ("..." if len(r5) > 500 else ""))
-    save_round("05_final", r5)
+        if verbose: print(f"FAIL5: {u5}")
+        _notify(callback, 5, "fail", {"error": u5})
+        return None
+    if verbose:
+        print(f"\n--- STEP5 DeepSeek->复查终版 [{len(r5)}c, {u5.get('completion_tokens', '?')}t] ---")
+        print(r5[:500] + ("..." if len(r5) > 500 else ""))
+    paths.append(save_round("05_final", r5))
+    _notify(callback, 5, "done", {
+        "name": "DeepSeek final", "tokens": u5.get("completion_tokens", "?"),
+        "len": len(r5), "path": paths[-1]
+    })
 
     dt = time.time() - t0
-    print(f"\n{'=' * 55}\n  DONE {dt:.1f}s\n{'=' * 55}")
-    return {"code": r5, "review": r4, "elapsed": round(dt, 1)}
+    if verbose:
+        print(f"\n{'=' * 55}\n  DONE {dt:.1f}s\n{'=' * 55}")
+    return {"code": r5, "review": r4, "elapsed": round(dt, 1), "paths": paths}
 
 
 if __name__ == "__main__":

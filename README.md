@@ -27,20 +27,41 @@ cp .env.example .env
 # 编辑 .env 填入 KIMI_KEY / KIMI_CODE_KEY / DEEPSEEK_KEY
 ```
 
-## 使用
+## 使用方式
+
+### 1. 终端页面版（推荐）
 
 ```bash
-# 方式 1：直接运行
-python pipeline.py "用 Python 写一个 Flask REST API，支持用户注册和登录"
-
-# 方式 2：标准输入
-echo "用 Go 写一个并发爬虫" | python pipeline.py
+python code_tui.py
+python code_tui.py "用 Python 写一个 Flask REST API，支持用户注册和登录"
 ```
 
-推荐 shell alias（把 `code-` 变成调用入口）：
+效果：
+- 实时显示 5 步流水线进度
+- 最终代码高亮展示
+- 自动列出所有中间文件
+
+### 2. 命令行版
 
 ```bash
-alias code-='python "C:/Users/ShortPome/kimi-deeepseek/pipeline.py"'
+python pipeline.py "用 Python 写一个 Flask REST API，支持用户注册和登录"
+```
+
+### 3. Claude Code 插件
+
+把仓库放到任意位置后，Claude Code 会自动识别 `.claude/commands/code.json`：
+
+```bash
+# 在 Claude Code 中输入
+/code 用 Python 写一个 Flask REST API，支持用户注册和登录
+```
+
+如果你把仓库 clone 到了其他位置，需要修改 `.claude/commands/code.json` 里的 `command` 路径。
+
+### 4. Shell alias
+
+```bash
+alias code-='python "C:/Users/ShortPome/kimi-deeepseek/code_tui.py"'
 # 之后就可以：
 code- "用 Rust 写一个 CLI 计时器"
 ```
@@ -66,3 +87,15 @@ code- "用 Rust 写一个 CLI 计时器"
 - `03_code_*.md` — DeepSeek 初版代码
 - `04_review_*.md` — KimiCode 的批判性审查与修复
 - `05_final_*.md` — DeepSeek 终版代码
+
+## 项目结构
+
+```
+.
+├── .claude/commands/code.json     # Claude Code slash 命令
+├── .env.example                   # 密钥模板
+├── .gitignore                     # 忽略 .env / outputs
+├── README.md
+├── code_tui.py                    # 终端页面版入口
+└── pipeline.py                    # 核心流水线
+```
