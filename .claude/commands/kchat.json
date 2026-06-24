@@ -1,6 +1,6 @@
 {
   "name": "kchat",
-  "description": "Open Kimi-DeepSeek terminal chat dialog",
-  "command": "python C:/Users/ShortPome/.claude/skills/code-pipeline/code_chat.py",
-  "prompt": "Launch the terminal chat dialog for the Kimi-DeepSeek multi-model code pipeline. The user can then type questions interactively."
+  "description": "Kimi-DeepSeek 代码生成助手（聊天式交互）",
+  "command": "python C:/Users/ShortPome/.claude/skills/code-pipeline/pipeline.py",
+  "prompt": "You are the Kimi-DeepSeek code generation assistant. The user wants to generate or fix code using the multi-model pipeline (Kimi → KimiCode → DeepSeek → KimiCode critique → DeepSeek final). Invoke the command with the user's exact question passed via stdin. The pipeline will print the final code to stdout. Present the code to the user in a clean format, briefly explain what was done, and ask if they need any changes. If the user pasted a file path, the pipeline will automatically read it."
 }
