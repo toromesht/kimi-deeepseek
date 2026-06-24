@@ -103,6 +103,29 @@ def attach_files(q):
     return "".join(parts)
 
 
+def attach_file_paths(q):
+    """只附加文件路径，不附加内容（给 Kimi 小上下文模型用）"""
+    paths = _extract_file_paths(q)
+    if not paths:
+        return q
+    parts = [q, "\n\n--- 涉及文件 ---\n"]
+    for p in paths:
+        parts.append(f"- {p}\n")
+    parts.append("\n完整文件内容会在后续步骤提供给 DeepSeek。")
+    return "".join(parts)
+
+
+def _use_smart_attach():
+    """是否启用智能附件路由：Kimi 只看路径，DeepSeek 看完整内容"""
+    val = os.environ.get("SMART_ATTACH", "auto").lower()
+    if val in ("1", "true", "yes"):
+        return True
+    if val in ("0", "false", "no"):
+        return False
+    # auto: 当不截断文件且文件大于 8k 字符时启用
+    return _get_max_attach_chars() == 0
+
+
 CFG = {
     "kimi": {
         "url": os.environ.get("KIMI_BASE", "https://api.moonshot.cn/v1") + "/chat/completions",
@@ -128,10 +151,25 @@ CFG = {
 }
 
 
+def _get_retry_config():
+    """读取重试配置"""
+    try:
+        retries = int(os.environ.get("API_MAX_RETRIES", "2"))
+    except ValueError:
+        retries = 2
+    try:
+        timeout = int(os.environ.get("API_TIMEOUT", "300"))
+    except ValueError:
+        timeout = 300
+    return retries, timeout
+
+
 def call(svc, system, user, max_tok=None):
     c = CFG[svc]
     if not c["key"]:
         return None, f"MISSING_KEY:{svc}"
+
+    max_retries, timeout = _get_retry_config()
     body = json.dumps({
         "model": c["model"],
         "messages": [
@@ -141,18 +179,33 @@ def call(svc, system, user, max_tok=None):
         "max_tokens": max_tok or c["max_tok"],
         "temperature": c["temp"],
     }).encode()
-    req = urllib.request.Request(c["url"], data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {c['key']}")
-    try:
-        with urllib.request.urlopen(req, timeout=300,
-                                     context=ssl.create_default_context()) as r:
-            d = json.loads(r.read())
-            return d["choices"][0]["message"]["content"], d.get("usage", {})
-    except urllib.error.HTTPError as e:
-        return None, f"HTTP{e.code}:{(e.read()[:400].decode() if e.fp else str(e))}"
-    except Exception as e:
-        return None, str(e)[:300]
+
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(c["url"], data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {c['key']}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                         context=ssl.create_default_context()) as r:
+                d = json.loads(r.read())
+                return d["choices"][0]["message"]["content"], d.get("usage", {})
+        except urllib.error.HTTPError as e:
+            err_body = e.read()[:800].decode("utf-8", errors="replace") if e.fp else str(e)
+            last_error = f"HTTP{e.code}:{err_body}"
+            # 4xx 客户端错误不重试
+            if 400 <= e.code < 500:
+                break
+        except Exception as e:
+            last_error = str(e)[:500]
+
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            if os.environ.get("PIPELINE_DEBUG"):
+                print(f"[{svc}] 请求失败，{wait}s 后重试 ({attempt+1}/{max_retries}): {last_error}")
+            time.sleep(wait)
+
+    return None, last_error
 
 
 def save_round(step, text, out_dir="outputs"):
@@ -197,20 +250,24 @@ def run(q, history=None, callback=None, verbose=True):
     data: {'name','model','tokens','len','path','error',...}
     """
     t0 = time.time()
-    paths = []
-    q = attach_files(q)
+    out_paths = []
+    q_raw = q
+    q_full = attach_files(q)
+    smart = _use_smart_attach() and q_full != q_raw
+    q_kimi = attach_file_paths(q_raw) if smart else q_full
     history_ctx = _format_history(history)
     if verbose:
-        print(f"\n{'#' * 55}\n  Q: {q[:120]}{'...' if len(q) > 120 else ''}\n{'#' * 55}")
+        display_q = q_full if not smart else q_kimi
+        print(f"\n{'#' * 55}\n  Q: {display_q[:120]}{'...' if len(display_q) > 120 else ''}\n{'#' * 55}")
 
     # STEP 1: Kimi 写提示词
     _notify(callback, 1, "start", {"name": "Kimi prompt", "model": CFG['kimi']['model']})
     prompt1 = (
         f"{history_ctx}\n"
-        f"当前问题：{q}\n\n"
+        f"当前问题：{q_kimi}\n\n"
         "请根据以上问题和历史对话，写给代码 AI 的详细提示词。"
         "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。"
-    ) if history_ctx else q
+    ) if history_ctx else q_kimi
     r1, u1 = call("kimi",
         "你是 Prompt 工程师。根据用户问题和历史对话，写给代码 AI 的详细提示词。"
         "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。", prompt1)
@@ -221,10 +278,10 @@ def run(q, history=None, callback=None, verbose=True):
     if verbose:
         print(f"\n--- STEP1 Kimi->提示词 [{len(r1)}c, {u1.get('completion_tokens', '?')}t] ---")
         print(r1[:400] + ("..." if len(r1) > 400 else ""))
-    paths.append(save_round("01_prompt", r1))
+    out_paths.append(save_round("01_prompt", r1))
     _notify(callback, 1, "done", {
         "name": "Kimi prompt", "tokens": u1.get("completion_tokens", "?"),
-        "len": len(r1), "path": paths[-1]
+        "len": len(r1), "path": out_paths[-1]
     })
 
     # STEP 2: KimiCode 写框架
@@ -239,24 +296,24 @@ def run(q, history=None, callback=None, verbose=True):
     if verbose:
         print(f"\n--- STEP2 KimiCode->框架 [{len(r2)}c, {u2.get('completion_tokens', '?')}t] ---")
         print(r2[:400] + ("..." if len(r2) > 400 else ""))
-    paths.append(save_round("02_framework", r2))
+    out_paths.append(save_round("02_framework", r2))
     _notify(callback, 2, "done", {
         "name": "KimiCode framework", "tokens": u2.get("completion_tokens", "?"),
-        "len": len(r2), "path": paths[-1]
+        "len": len(r2), "path": out_paths[-1]
     })
 
     # STEP 3: DeepSeek 写代码
     _notify(callback, 3, "start", {"name": "DeepSeek code", "model": CFG['deepseek']['model']})
     prompt3 = (
         f"{history_ctx}\n"
-        f"当前需求：{q}\n\n"
+        f"当前需求：{q_full}\n\n"
         f"框架：\n{r2}\n\n"
         "请根据以上框架写完整可运行代码。要求："
         "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
         "4. 如果问题含测试要求，给出测试用例。"
-    ) if history_ctx else r2
+    )
     r3, u3 = call("deepseek",
-        "你是编程专家。根据框架和历史对话写完整可运行代码。要求："
+        "你是编程专家。根据框架、历史对话和完整需求写完整可运行代码。要求："
         "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
         "4. 如果问题含测试要求，给出测试用例。", prompt3,
         max_tok=16384)
@@ -267,22 +324,25 @@ def run(q, history=None, callback=None, verbose=True):
     if verbose:
         print(f"\n--- STEP3 DeepSeek->代码 [{len(r3)}c, {u3.get('completion_tokens', '?')}t] ---")
         print(r3[:400] + ("..." if len(r3) > 400 else ""))
-    paths.append(save_round("03_code", r3))
+    out_paths.append(save_round("03_code", r3))
     _notify(callback, 3, "done", {
         "name": "DeepSeek code", "tokens": u3.get("completion_tokens", "?"),
-        "len": len(r3), "path": paths[-1]
+        "len": len(r3), "path": out_paths[-1]
     })
 
     # STEP 4: KimiCode 检验+批判+修理
     _notify(callback, 4, "start", {"name": "KimiCode review", "model": CFG['kimi_code']['model']})
-    r4, u4 = call("kimi_code",
-        f"你是严格代码审查员，具备批判性思维。请对以下代码做：\n"
-        f"1. 检验语法和逻辑是否完整正确；\n"
-        f"2. 提出批判性质疑——对每个设计决策追问「为什么要这样做？」「有没有更好的方案？」"
-        f"「如果输入极端值会怎样？」「这个假设在什么条件下不成立？」；\n"
-        f"3. 直接修复发现的所有问题，输出修正后的完整代码。\n\n"
-        f"原始需求：{q}\n\n待审查代码：\n{r3}",
-        max_tok=8192)
+    prompt4 = (
+        f"{history_ctx}\n"
+        f"原始需求：{q_kimi}\n\n"
+        f"待审查代码：\n{r3}\n\n"
+        "你是严格代码审查员，具备批判性思维。请对以上代码做：\n"
+        "1. 检验语法和逻辑是否完整正确；\n"
+        "2. 提出批判性质疑——对每个设计决策追问「为什么要这样做？」「有没有更好的方案？」"
+        "「如果输入极端值会怎样？」「这个假设在什么条件下不成立？」；\n"
+        "3. 直接修复发现的所有问题，输出修正后的完整代码。"
+    )
+    r4, u4 = call("kimi_code", prompt4, max_tok=8192)
     if not r4:
         if verbose: print(f"FAIL4: {u4}")
         _notify(callback, 4, "fail", {"error": u4})
@@ -290,25 +350,20 @@ def run(q, history=None, callback=None, verbose=True):
     if verbose:
         print(f"\n--- STEP4 KimiCode->检验+批判+修理 [{len(r4)}c, {u4.get('completion_tokens', '?')}t] ---")
         print(r4[:500] + ("..." if len(r4) > 500 else ""))
-    paths.append(save_round("04_review", r4))
+    out_paths.append(save_round("04_review", r4))
     _notify(callback, 4, "done", {
         "name": "KimiCode review", "tokens": u4.get("completion_tokens", "?"),
-        "len": len(r4), "path": paths[-1]
+        "len": len(r4), "path": out_paths[-1]
     })
 
     # STEP 5: DeepSeek 复查批判意见，最终修改
     _notify(callback, 5, "start", {"name": "DeepSeek final", "model": CFG['deepseek']['model']})
     prompt5 = (
         f"{history_ctx}\n"
-        f"当前需求：{q}\n\n"
+        f"当前需求：{q_full}\n\n"
         f"审查意见与修改：\n{r4}\n\n"
         "请逐条审视审查意见，判断哪些接受、哪些驳回（附理由），"
         "综合所有合理建议，输出最终版完整代码。"
-    ) if history_ctx else (
-        f"代码审查员提出了批判性建议和修改。请你：\n"
-        f"1. 逐条审视审查意见，判断哪些接受、哪些驳回（附理由）；\n"
-        f"2. 综合所有合理建议，输出最终版完整代码。\n\n"
-        f"原始需求：{q}\n\n审查意见与修改：\n{r4}"
     )
     r5, u5 = call("deepseek",
         "代码审查员提出了批判性建议和修改。请你结合历史对话，"
@@ -322,16 +377,16 @@ def run(q, history=None, callback=None, verbose=True):
     if verbose:
         print(f"\n--- STEP5 DeepSeek->复查终版 [{len(r5)}c, {u5.get('completion_tokens', '?')}t] ---")
         print(r5[:500] + ("..." if len(r5) > 500 else ""))
-    paths.append(save_round("05_final", r5))
+    out_paths.append(save_round("05_final", r5))
     _notify(callback, 5, "done", {
         "name": "DeepSeek final", "tokens": u5.get("completion_tokens", "?"),
-        "len": len(r5), "path": paths[-1]
+        "len": len(r5), "path": out_paths[-1]
     })
 
     dt = time.time() - t0
     if verbose:
         print(f"\n{'=' * 55}\n  DONE {dt:.1f}s\n{'=' * 55}")
-    return {"code": r5, "review": r4, "elapsed": round(dt, 1), "paths": paths}
+    return {"code": r5, "review": r4, "elapsed": round(dt, 1), "paths": out_paths}
 
 
 if __name__ == "__main__":
