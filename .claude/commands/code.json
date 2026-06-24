@@ -1,0 +1,6 @@
+{
+  "name": "code",
+  "description": "Run Kimi + KimiCode + DeepSeek multi-model code pipeline",
+  "command": "python C:/Users/ShortPome/.claude/skills/code-pipeline/pipeline.py",
+  "prompt": "The user wants to generate code using the multi-model pipeline. Invoke the command with the user's exact question passed via stdin. After the pipeline finishes, read the latest file matching `C:/Users/ShortPome/.claude/skills/code-pipeline/outputs/05_final_*.md` and present the final code to the user. Also summarize the pipeline steps and saved output files."
+}
