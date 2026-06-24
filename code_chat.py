@@ -28,6 +28,10 @@ import pipeline
 class KimiCodeChat(App):
     """简洁终端对话应用"""
 
+    def __init__(self, **kwargs):
+        self.history = []
+        super().__init__(**kwargs)
+
     CSS = """
     Screen { align: center middle; }
 
@@ -117,6 +121,7 @@ class KimiCodeChat(App):
         inp.value = ""
         inp.disabled = True
 
+        self.history.append({"role": "user", "content": text})
         self._add_user(text)
         self._status("思考中...")
         self.run_pipeline(text)
@@ -125,7 +130,7 @@ class KimiCodeChat(App):
     def run_pipeline(self, question: str) -> None:
         try:
             t0 = time.time()
-            result = pipeline.run(question, verbose=False)
+            result = pipeline.run(question, history=self.history, verbose=False)
             elapsed = time.time() - t0
 
             if result is None:
@@ -134,6 +139,7 @@ class KimiCodeChat(App):
                 self.call_from_thread(self._add_system, f"❌ {result['error']}")
             else:
                 code = result.get("code", "")
+                self.history.append({"role": "assistant", "content": code})
                 self.call_from_thread(self._add_ai, code)
                 self.call_from_thread(self._status, f"完成 {elapsed:.1f}s")
         except Exception as e:
@@ -146,6 +152,7 @@ class KimiCodeChat(App):
             self.call_from_thread(enable)
 
     def action_clear(self) -> None:
+        self.history.clear()
         self._log().clear()
         self._log().write(Text("Kimi-Code 终端版已启动。输入问题生成代码。", style="dim"))
         self._log().write("")

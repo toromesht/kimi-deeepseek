@@ -156,8 +156,26 @@ def _notify(cb, step, status, data=None):
             pass
 
 
-def run(q, callback=None, verbose=True):
+def _format_history(history):
+    """把对话历史格式化成字符串，供后续模型参考"""
+    if not history:
+        return ""
+    parts = ["\n--- 历史对话 ---"]
+    for item in history[-6:]:  # 只保留最近 6 轮，避免超出上下文
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if role == "user":
+            parts.append(f"用户：{content[:800]}")
+        elif role == "assistant":
+            parts.append(f"助手：{content[:800]}")
+    parts.append("---\n")
+    return "\n".join(parts)
+
+
+def run(q, history=None, callback=None, verbose=True):
     """
+    q: 当前问题
+    history: 历史对话记录 [{"role":"user"/"assistant", "content":"..."}, ...]
     callback(step, status, data) 会在每步开始/完成/失败时被调用
     step: 1~5, status: 'start'|'done'|'fail'
     data: {'name','model','tokens','len','path','error',...}
@@ -165,14 +183,21 @@ def run(q, callback=None, verbose=True):
     t0 = time.time()
     paths = []
     q = attach_files(q)
+    history_ctx = _format_history(history)
     if verbose:
         print(f"\n{'#' * 55}\n  Q: {q[:120]}{'...' if len(q) > 120 else ''}\n{'#' * 55}")
 
     # STEP 1: Kimi 写提示词
     _notify(callback, 1, "start", {"name": "Kimi prompt", "model": CFG['kimi']['model']})
+    prompt1 = (
+        f"{history_ctx}\n"
+        f"当前问题：{q}\n\n"
+        "请根据以上问题和历史对话，写给代码 AI 的详细提示词。"
+        "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。"
+    ) if history_ctx else q
     r1, u1 = call("kimi",
-        "你是 Prompt 工程师。根据用户问题，写给代码 AI 的详细提示词。"
-        "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。", q)
+        "你是 Prompt 工程师。根据用户问题和历史对话，写给代码 AI 的详细提示词。"
+        "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。", prompt1)
     if not r1:
         if verbose: print(f"FAIL1: {u1}")
         _notify(callback, 1, "fail", {"error": u1})
@@ -206,10 +231,18 @@ def run(q, callback=None, verbose=True):
 
     # STEP 3: DeepSeek 写代码
     _notify(callback, 3, "start", {"name": "DeepSeek code", "model": CFG['deepseek']['model']})
-    r3, u3 = call("deepseek",
-        "你是编程专家。根据框架写完整可运行代码。要求："
+    prompt3 = (
+        f"{history_ctx}\n"
+        f"当前需求：{q}\n\n"
+        f"框架：\n{r2}\n\n"
+        "请根据以上框架写完整可运行代码。要求："
         "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
-        "4. 如果问题含测试要求，给出测试用例。", r2,
+        "4. 如果问题含测试要求，给出测试用例。"
+    ) if history_ctx else r2
+    r3, u3 = call("deepseek",
+        "你是编程专家。根据框架和历史对话写完整可运行代码。要求："
+        "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
+        "4. 如果问题含测试要求，给出测试用例。", prompt3,
         max_tok=16384)
     if not r3:
         if verbose: print(f"FAIL3: {u3}")
@@ -249,11 +282,22 @@ def run(q, callback=None, verbose=True):
 
     # STEP 5: DeepSeek 复查批判意见，最终修改
     _notify(callback, 5, "start", {"name": "DeepSeek final", "model": CFG['deepseek']['model']})
-    r5, u5 = call("deepseek",
+    prompt5 = (
+        f"{history_ctx}\n"
+        f"当前需求：{q}\n\n"
+        f"审查意见与修改：\n{r4}\n\n"
+        "请逐条审视审查意见，判断哪些接受、哪些驳回（附理由），"
+        "综合所有合理建议，输出最终版完整代码。"
+    ) if history_ctx else (
         f"代码审查员提出了批判性建议和修改。请你：\n"
         f"1. 逐条审视审查意见，判断哪些接受、哪些驳回（附理由）；\n"
         f"2. 综合所有合理建议，输出最终版完整代码。\n\n"
-        f"原始需求：{q}\n\n审查意见与修改：\n{r4}",
+        f"原始需求：{q}\n\n审查意见与修改：\n{r4}"
+    )
+    r5, u5 = call("deepseek",
+        "代码审查员提出了批判性建议和修改。请你结合历史对话，"
+        "逐条审视审查意见，判断哪些接受、哪些驳回（附理由），"
+        "综合所有合理建议，输出最终版完整代码。", prompt5,
         max_tok=16384)
     if not r5:
         if verbose: print(f"FAIL5: {u5}")
