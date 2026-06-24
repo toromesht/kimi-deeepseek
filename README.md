@@ -75,6 +75,28 @@ kcode "用 Rust 写一个 CLI 计时器"
 
 > 用 `kcode` 而不是 `code`，避免和 VS Code 的 `code` 命令冲突。
 
+### 5. 对话框版 `kchat`
+
+类似 Kimi / Claude 的聊天界面，支持多轮对话：
+
+```bash
+python code_chat.py
+```
+
+```powershell
+kchat    # PowerShell alias，新开窗口生效
+```
+
+```bash
+kchat    # Git Bash alias
+```
+
+功能：
+- 底部输入框，Enter 发送
+- 代码块语法高亮
+- 支持粘贴文件路径自动读取
+- Ctrl+L 清空对话
+
 ## 环境变量
 
 | 变量 | 说明 | 必填 |
@@ -106,5 +128,6 @@ kcode "用 Rust 写一个 CLI 计时器"
 ├── .gitignore                     # 忽略 .env / outputs
 ├── README.md
 ├── code_tui.py                    # 终端页面版入口
+├── code_chat.py                   # 终端对话框版入口
 └── pipeline.py                    # 核心流水线
 ```
