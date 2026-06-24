@@ -1,0 +1,6 @@
+{
+  "name": "kchat",
+  "description": "Open Kimi-DeepSeek terminal chat dialog",
+  "command": "python C:/Users/ShortPome/.claude/skills/code-pipeline/code_chat.py",
+  "prompt": "Launch the terminal chat dialog for the Kimi-DeepSeek multi-model code pipeline. The user can then type questions interactively."
+}
