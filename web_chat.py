@@ -36,6 +36,14 @@ def event_stream(chat_id, question):
     """SSE 流，返回流水线每一步的状态"""
     q = queue.Queue()
 
+    # 获取历史对话（不包含当前问题）
+    with CHATS_LOCK:
+        if chat_id not in CHATS:
+            CHATS[chat_id] = []
+        history = list(CHATS[chat_id])
+        # 保存当前用户消息
+        CHATS[chat_id].append({"role": "user", "content": question, "time": time.time()})
+
     def callback(step, status, data):
         q.put({
             "event": "step",
@@ -48,7 +56,7 @@ def event_stream(chat_id, question):
     def worker():
         try:
             t0 = time.time()
-            result = pipeline.run(question, callback=callback, verbose=False)
+            result = pipeline.run(question, history=history, callback=callback, verbose=False)
             elapsed = time.time() - t0
             if result is None:
                 q.put({"event": "error", "error": "流水线返回空结果"})
@@ -66,12 +74,6 @@ def event_stream(chat_id, question):
             q.put({"event": "error", "error": f"{e}\n\n{traceback.format_exc()}"})
         finally:
             q.put({"event": "close"})
-
-    # 保存用户消息
-    with CHATS_LOCK:
-        if chat_id not in CHATS:
-            CHATS[chat_id] = []
-        CHATS[chat_id].append({"role": "user", "content": question, "time": time.time()})
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
