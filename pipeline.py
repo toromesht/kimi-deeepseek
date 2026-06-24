@@ -57,16 +57,31 @@ def _extract_file_paths(text):
     return list(dict.fromkeys(paths))  # 去重
 
 
-def _load_file_content(path, max_chars=4_000):
-    """读取文本文件，带编码回退。限制长度避免超出模型上下文。"""
+def _get_max_attach_chars():
+    """从环境变量读取附件截断长度。0 表示不截断。"""
+    val = os.environ.get("MAX_ATTACH_CHARS", "4000")
+    try:
+        n = int(val)
+        return n if n >= 0 else 4_000
+    except ValueError:
+        return 4_000
+
+
+def _load_file_content(path, max_chars=None):
+    """读取文本文件，带编码回退。max_chars=0 表示不截断。"""
+    if max_chars is None:
+        max_chars = _get_max_attach_chars()
     try:
         size = os.path.getsize(path)
         encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin1"]
         for enc in encodings:
             try:
                 with open(path, "r", encoding=enc, errors="replace") as f:
-                    content = f.read(max_chars)
-                if len(content) >= max_chars:
+                    if max_chars == 0:
+                        content = f.read()
+                    else:
+                        content = f.read(max_chars)
+                if max_chars > 0 and len(content) >= max_chars:
                     content = content[:max_chars] + f"\n\n[文件内容过长，已截断至前 {max_chars} 字符]"
                 return content
             except UnicodeDecodeError:
@@ -81,9 +96,10 @@ def attach_files(q):
     paths = _extract_file_paths(q)
     if not paths:
         return q
+    max_chars = _get_max_attach_chars()
     parts = [q, "\n\n--- 附件文件内容 ---\n"]
     for p in paths:
-        parts.append(f"\n### {p}\n```\n{_load_file_content(p)}\n```\n")
+        parts.append(f"\n### {p}\n```\n{_load_file_content(p, max_chars)}\n```\n")
     return "".join(parts)
 
 
