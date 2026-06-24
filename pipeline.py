@@ -1,392 +1,211 @@
 #!/usr/bin/env python3
 """
-code-<问题> 多模型流水线
-  Kimi(提示词) -> KimiCode(框架) -> DeepSeek(代码)
-  -> KimiCode(检验+批判+修理) -> DeepSeek(复查修bug) -> 输出
+Kimi-DeepSeek 多模型代码生成流水线（Reflexion + Capability-Aware Router）
 
-用法:
-  python pipeline.py "<问题>"
-  code-"<问题>"   (如果配了 shell alias)
+流程：
+  Planner(Kimi) -> Coder(DeepSeek) -> Critic(KimiCode) -> Validator -> Repairer(DeepSeek)
 
-密钥读取优先级: 环境变量 > 同目录 .env 文件
+模式：
+  full  : 完整五角色反射环
+  fast  : DeepSeek 编码 + DeepSeek 自审查修复
+  ultra : DeepSeek 单模型强输出（CoT + 自我审查）
+
+环境变量：
+  PIPELINE_MODE=full|fast|ultra
+  SMART_ATTACH=auto|1|0
+  MAX_ATTACH_CHARS=0
+  API_MAX_RETRIES=2
+  API_TIMEOUT=300
+  KIMI_CONTEXT_LIMIT=6000
+  DS_CONTEXT_LIMIT=100000
 """
-import sys, os, json, time, ssl, urllib.request, urllib.error
+import sys
+import time
+from enum import Enum
+from typing import Optional, List, Dict, Any, Callable
+
+from pipeline_core import Config, Router, ContextManager, check_missing_keys
+from pipeline_steps import (
+    PipelineResult, PlannerStep, CoderStep, CriticStep,
+    ValidatorStep, RepairerStep, UltraStep, extract_code,
+)
+
+
+class Mode(str, Enum):
+    FULL = "full"
+    FAST = "fast"
+    ULTRA = "ultra"
+
+
+class Pipeline:
+    """多模型代码生成流水线编排器。"""
+
+    def __init__(self, mode: Optional[str] = None,
+                 callback: Optional[Callable] = None,
+                 verbose: bool = True):
+        self.mode = self._normalize_mode(mode or Config.PIPELINE_MODE)
+        self.callback = callback
+        self.verbose = verbose
+        self.router = Router()
+        self.paths: List[str] = []
+
+    def _normalize_mode(self, mode: str) -> str:
+        m = mode.lower()
+        if m in ("full", "fast", "ultra"):
+            return m
+        return "full"
+
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
+
+    def run(self, question: str,
+            history: Optional[List[Dict[str, str]]] = None,
+            context_files: Optional[List[str]] = None) -> PipelineResult:
+        t0 = time.time()
+        self.paths = []
+        ctx = ContextManager(question, history=history, context_files=context_files)
+
+        self._log(f"\n{'#' * 60}\n  MODE: {self.mode.upper()}\n  Q: {question[:120]}{'...' if len(question) > 120 else ''}\n{'#' * 60}")
+
+        if self.mode == "ultra":
+            return self._run_ultra(ctx, t0)
+        if self.mode == "fast":
+            return self._run_fast(ctx, t0)
+        return self._run_full(ctx, t0)
+
+    def _run_full(self, ctx: ContextManager, t0: float) -> PipelineResult:
+        # Step 1: Planner
+        planner = PlannerStep(self.router, self.callback, self.verbose)
+        r1 = planner.run(ctx)
+        if "error" in r1:
+            return self._error(r1["error"], "planner")
+        self.paths.extend(planner.paths)
+        plan = r1["text"]
+
+        # Step 2: Coder
+        coder = CoderStep(self.router, self.callback, self.verbose)
+        r2 = coder.run(ctx, plan)
+        if "error" in r2:
+            return self._error(r2["error"], "coder")
+        self.paths.extend(coder.paths)
+        code_v1 = extract_code(r2["text"])
+
+        # Step 3: Critic
+        critic = CriticStep(self.router, self.callback, self.verbose)
+        r3 = critic.run(ctx, code_v1)
+        if "error" in r3:
+            return self._error(r3["error"], "critic")
+        self.paths.extend(critic.paths)
+        review = r3["text"]
+        code_v2 = extract_code(review) or code_v1
+
+        # Step 4: Validator
+        validator = ValidatorStep(self.router, self.callback, self.verbose)
+        r4 = validator.run(ctx, code_v2)
+        if "error" in r4:
+            # 验证失败不致命，继续用 v2
+            validation = r4.get("error", "")
+        else:
+            self.paths.extend(validator.paths)
+            validation = r4["report"]
+
+        # Step 5: Repairer
+        repairer = RepairerStep(self.router, self.callback, self.verbose)
+        r5 = repairer.run(ctx, code_v2, review, validation)
+        if "error" in r5:
+            return self._error(r5["error"], "repairer")
+        self.paths.extend(repairer.paths)
+        final_code = extract_code(r5["text"])
+
+        elapsed = round(time.time() - t0, 1)
+        self._log(f"\n{'=' * 60}\n  DONE full mode in {elapsed}s\n{'=' * 60}")
+        return PipelineResult(
+            code=final_code,
+            review=review,
+            validation=validation,
+            elapsed=elapsed,
+            paths=self.paths,
+            mode="full",
+        )
+
+    def _run_fast(self, ctx: ContextManager, t0: float) -> PipelineResult:
+        # DeepSeek 直接编码
+        coder = CoderStep(self.router, self.callback, self.verbose)
+        plan = (
+            "1. 理解用户需求\n"
+            "2. 编写结构清晰、可运行的代码\n"
+            "3. 添加必要错误处理和注释\n"
+            "4. 自我审查常见边界错误并修复"
+        )
+        r1 = coder.run(ctx, plan)
+        if "error" in r1:
+            return self._error(r1["error"], "coder")
+        self.paths.extend(coder.paths)
+        code_v1 = extract_code(r1["text"])
+
+        # DeepSeek 自审查修复
+        repairer = RepairerStep(self.router, self.callback, self.verbose)
+        r2 = repairer.run(ctx, code_v1, "请自我审查并修复潜在问题", "")
+        if "error" in r2:
+            # 修复失败回退到 v1
+            final_code = code_v1
+            review = ""
+        else:
+            self.paths.extend(repairer.paths)
+            review = r2["text"]
+            final_code = extract_code(review) or code_v1
+
+        elapsed = round(time.time() - t0, 1)
+        self._log(f"\n{'=' * 60}\n  DONE fast mode in {elapsed}s\n{'=' * 60}")
+        return PipelineResult(
+            code=final_code,
+            review=review,
+            validation="",
+            elapsed=elapsed,
+            paths=self.paths,
+            mode="fast",
+        )
+
+    def _run_ultra(self, ctx: ContextManager, t0: float) -> PipelineResult:
+        ultra = UltraStep(self.router, self.callback, self.verbose)
+        r = ultra.run(ctx)
+        if "error" in r:
+            return self._error(r["error"], "ultra")
+        self.paths.extend(ultra.paths)
+        final_code = extract_code(r["text"])
+
+        elapsed = round(time.time() - t0, 1)
+        self._log(f"\n{'=' * 60}\n  DONE ultra mode in {elapsed}s\n{'=' * 60}")
+        return PipelineResult(
+            code=final_code,
+            review=r["text"],
+            validation="",
+            elapsed=elapsed,
+            paths=self.paths,
+            mode="ultra",
+        )
+
+    def _error(self, error: str, step: str) -> PipelineResult:
+        self._log(f"\n{'=' * 60}\n  ERROR at {step}: {error}\n{'=' * 60}")
+        return PipelineResult(error=error, step=step, mode=self.mode, paths=self.paths)
+
 
 # ------------------------------------------------------------
-# 加载 .env（不依赖 python-dotenv）
-# 按优先级查找：脚本目录 > 当前工作目录 > ~/.claude/skills/code-pipeline
+# 兼容旧接口
 # ------------------------------------------------------------
-_CANDIDATE_ENV_PATHS = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
-    os.path.join(os.getcwd(), ".env"),
-    os.path.join(os.path.expanduser("~"), ".claude", "skills", "code-pipeline", ".env"),
-]
-_ENV_PATH = None
-for _p in _CANDIDATE_ENV_PATHS:
-    if os.path.exists(_p):
-        _ENV_PATH = _p
-        break
-
-if _ENV_PATH:
-    with open(_ENV_PATH, "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if not _line or _line.startswith("#") or "=" not in _line:
-                continue
-            _k, _v = _line.split("=", 1)
-            _k = _k.strip()
-            _v = _v.strip().strip('"').strip("'")
-            if _k and _k not in os.environ:
-                os.environ[_k] = _v
-
-# ------------------------------------------------------------
-# 自动读取问题中引用的本地文件
-# ------------------------------------------------------------
-import re
-
-_FILE_PATH_RE = re.compile(r'["\']([a-zA-Z]:\\[^"\']+)["\']|([a-zA-Z]:\\\S+)', re.IGNORECASE)
-
-
-def _extract_file_paths(text):
-    """从文本中提取 Windows 绝对路径"""
-    paths = []
-    for m in _FILE_PATH_RE.finditer(text):
-        p = m.group(1) or m.group(2)
-        if p and os.path.isfile(p):
-            paths.append(p)
-    return list(dict.fromkeys(paths))  # 去重
-
-
-def _get_max_attach_chars():
-    """从环境变量读取附件截断长度。0 表示不截断。"""
-    val = os.environ.get("MAX_ATTACH_CHARS", "4000")
-    try:
-        n = int(val)
-        return n if n >= 0 else 4_000
-    except ValueError:
-        return 4_000
-
-
-def _load_file_content(path, max_chars=None):
-    """读取文本文件，带编码回退。max_chars=0 表示不截断。"""
-    if max_chars is None:
-        max_chars = _get_max_attach_chars()
-    try:
-        size = os.path.getsize(path)
-        encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin1"]
-        for enc in encodings:
-            try:
-                with open(path, "r", encoding=enc, errors="replace") as f:
-                    if max_chars == 0:
-                        content = f.read()
-                    else:
-                        content = f.read(max_chars)
-                if max_chars > 0 and len(content) >= max_chars:
-                    content = content[:max_chars] + f"\n\n[文件内容过长，已截断至前 {max_chars} 字符]"
-                return content
-            except UnicodeDecodeError:
-                continue
-        return "[无法解码文件内容]"
-    except Exception as e:
-        return f"[读取文件失败: {e}]"
-
-
-def attach_files(q):
-    """如果问题中包含文件路径，把文件内容附加到问题里"""
-    paths = _extract_file_paths(q)
-    if not paths:
-        return q
-    max_chars = _get_max_attach_chars()
-    parts = [q, "\n\n--- 附件文件内容 ---\n"]
-    for p in paths:
-        parts.append(f"\n### {p}\n```\n{_load_file_content(p, max_chars)}\n```\n")
-    return "".join(parts)
-
-
-def attach_file_paths(q):
-    """只附加文件路径，不附加内容（给 Kimi 小上下文模型用）"""
-    paths = _extract_file_paths(q)
-    if not paths:
-        return q
-    parts = [q, "\n\n--- 涉及文件 ---\n"]
-    for p in paths:
-        parts.append(f"- {p}\n")
-    parts.append("\n完整文件内容会在后续步骤提供给 DeepSeek。")
-    return "".join(parts)
-
-
-def _use_smart_attach():
-    """是否启用智能附件路由：Kimi 只看路径，DeepSeek 看完整内容"""
-    val = os.environ.get("SMART_ATTACH", "auto").lower()
-    if val in ("1", "true", "yes"):
-        return True
-    if val in ("0", "false", "no"):
-        return False
-    # auto: 当不截断文件且文件大于 8k 字符时启用
-    return _get_max_attach_chars() == 0
-
-
-CFG = {
-    "kimi": {
-        "url": os.environ.get("KIMI_BASE", "https://api.moonshot.cn/v1") + "/chat/completions",
-        "key": os.environ.get("KIMI_KEY", ""),
-        "model": os.environ.get("KIMI_MODEL", "moonshot-v1-8k"),
-        "max_tok": 2048,
-        "temp": 0.7,
-    },
-    "kimi_code": {
-        "url": os.environ.get("KIMI_CODE_BASE", "https://api.moonshot.cn/v1") + "/chat/completions",
-        "key": os.environ.get("KIMI_CODE_KEY", ""),
-        "model": os.environ.get("KIMI_CODE_MODEL", "moonshot-v1-8k"),
-        "max_tok": 4096,
-        "temp": 0.5,
-    },
-    "deepseek": {
-        "url": os.environ.get("DEEPSEEK_BASE", "https://api.deepseek.com/v1") + "/chat/completions",
-        "key": os.environ.get("DEEPSEEK_KEY", ""),
-        "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
-        "max_tok": 16384,
-        "temp": 0.3,
-    },
-}
-
-
-def _get_retry_config():
-    """读取重试配置"""
-    try:
-        retries = int(os.environ.get("API_MAX_RETRIES", "2"))
-    except ValueError:
-        retries = 2
-    try:
-        timeout = int(os.environ.get("API_TIMEOUT", "300"))
-    except ValueError:
-        timeout = 300
-    return retries, timeout
-
-
-def call(svc, system, user, max_tok=None):
-    c = CFG[svc]
-    if not c["key"]:
-        return None, f"MISSING_KEY:{svc}"
-
-    max_retries, timeout = _get_retry_config()
-    body = json.dumps({
-        "model": c["model"],
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": max_tok or c["max_tok"],
-        "temperature": c["temp"],
-    }).encode()
-
-    last_error = ""
-    for attempt in range(max_retries + 1):
-        req = urllib.request.Request(c["url"], data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", f"Bearer {c['key']}")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout,
-                                         context=ssl.create_default_context()) as r:
-                d = json.loads(r.read())
-                return d["choices"][0]["message"]["content"], d.get("usage", {})
-        except urllib.error.HTTPError as e:
-            err_body = e.read()[:800].decode("utf-8", errors="replace") if e.fp else str(e)
-            last_error = f"HTTP{e.code}:{err_body}"
-            # 4xx 客户端错误不重试
-            if 400 <= e.code < 500:
-                break
-        except Exception as e:
-            last_error = str(e)[:500]
-
-        if attempt < max_retries:
-            wait = 2 ** attempt
-            if os.environ.get("PIPELINE_DEBUG"):
-                print(f"[{svc}] 请求失败，{wait}s 后重试 ({attempt+1}/{max_retries}): {last_error}")
-            time.sleep(wait)
-
-    return None, last_error
-
-
-def save_round(step, text, out_dir="outputs"):
-    os.makedirs(out_dir, exist_ok=True)
-    ts = time.strftime("%m%d_%H%M%S")
-    path = os.path.join(out_dir, f"{step}_{ts}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    return path
-
-
-def _notify(cb, step, status, data=None):
-    if cb:
-        try:
-            cb(step, status, data or {})
-        except Exception:
-            pass
-
-
-def _format_history(history):
-    """把对话历史格式化成字符串，供后续模型参考"""
-    if not history:
-        return ""
-    parts = ["\n--- 历史对话 ---"]
-    for item in history[-6:]:  # 只保留最近 6 轮，避免超出上下文
-        role = item.get("role", "")
-        content = item.get("content", "")
-        if role == "user":
-            parts.append(f"用户：{content[:800]}")
-        elif role == "assistant":
-            parts.append(f"助手：{content[:800]}")
-    parts.append("---\n")
-    return "\n".join(parts)
-
-
-def run(q, history=None, callback=None, verbose=True):
+def run(question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        callback: Optional[Callable] = None,
+        verbose: bool = True,
+        context_files: Optional[List[str]] = None) -> Dict[str, Any]:
     """
-    q: 当前问题
-    history: 历史对话记录 [{"role":"user"/"assistant", "content":"..."}, ...]
-    callback(step, status, data) 会在每步开始/完成/失败时被调用
-    step: 1~5, status: 'start'|'done'|'fail'
-    data: {'name','model','tokens','len','path','error',...}
+    兼容旧版调用：pipeline.run(question, history=..., callback=..., verbose=...)
+    返回 dict（含 code / review / validation / elapsed / paths / mode / error）。
     """
-    t0 = time.time()
-    out_paths = []
-    q_raw = q
-    q_full = attach_files(q)
-    smart = _use_smart_attach() and q_full != q_raw
-    q_kimi = attach_file_paths(q_raw) if smart else q_full
-    history_ctx = _format_history(history)
-    if verbose:
-        display_q = q_full if not smart else q_kimi
-        print(f"\n{'#' * 55}\n  Q: {display_q[:120]}{'...' if len(display_q) > 120 else ''}\n{'#' * 55}")
-
-    # STEP 1: Kimi 写提示词
-    _notify(callback, 1, "start", {"name": "Kimi prompt", "model": CFG['kimi']['model']})
-    prompt1 = (
-        f"{history_ctx}\n"
-        f"当前问题：{q_kimi}\n\n"
-        "请根据以上问题和历史对话，写给代码 AI 的详细提示词。"
-        "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。"
-    ) if history_ctx else q_kimi
-    r1, u1 = call("kimi",
-        "你是 Prompt 工程师。根据用户问题和历史对话，写给代码 AI 的详细提示词。"
-        "包含：技术选型、输入输出、边界条件、错误处理、测试要点。直接输出提示词。", prompt1)
-    if not r1:
-        if verbose: print(f"FAIL1: {u1}")
-        _notify(callback, 1, "fail", {"error": u1})
-        return {"error": f"Step 1 (Kimi prompt) failed: {u1}", "step": 1}
-    if verbose:
-        print(f"\n--- STEP1 Kimi->提示词 [{len(r1)}c, {u1.get('completion_tokens', '?')}t] ---")
-        print(r1[:400] + ("..." if len(r1) > 400 else ""))
-    out_paths.append(save_round("01_prompt", r1))
-    _notify(callback, 1, "done", {
-        "name": "Kimi prompt", "tokens": u1.get("completion_tokens", "?"),
-        "len": len(r1), "path": out_paths[-1]
-    })
-
-    # STEP 2: KimiCode 写框架
-    _notify(callback, 2, "start", {"name": "KimiCode framework", "model": CFG['kimi_code']['model']})
-    r2, u2 = call("kimi_code",
-        "你是架构师。根据提示词写代码框架：模块划分、函数签名、伪代码、数据流。"
-        "只写框架，不写具体实现。", r1)
-    if not r2:
-        if verbose: print(f"FAIL2: {u2}")
-        _notify(callback, 2, "fail", {"error": u2})
-        return {"error": f"Step 2 (KimiCode framework) failed: {u2}", "step": 2}
-    if verbose:
-        print(f"\n--- STEP2 KimiCode->框架 [{len(r2)}c, {u2.get('completion_tokens', '?')}t] ---")
-        print(r2[:400] + ("..." if len(r2) > 400 else ""))
-    out_paths.append(save_round("02_framework", r2))
-    _notify(callback, 2, "done", {
-        "name": "KimiCode framework", "tokens": u2.get("completion_tokens", "?"),
-        "len": len(r2), "path": out_paths[-1]
-    })
-
-    # STEP 3: DeepSeek 写代码
-    _notify(callback, 3, "start", {"name": "DeepSeek code", "model": CFG['deepseek']['model']})
-    prompt3 = (
-        f"{history_ctx}\n"
-        f"当前需求：{q_full}\n\n"
-        f"框架：\n{r2}\n\n"
-        "请根据以上框架写完整可运行代码。要求："
-        "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
-        "4. 如果问题含测试要求，给出测试用例。"
-    )
-    r3, u3 = call("deepseek",
-        "你是编程专家。根据框架、历史对话和完整需求写完整可运行代码。要求："
-        "1. 代码干净、注释适度；2. 有错误处理；3. 多文件时用 ```filename:path 标记；"
-        "4. 如果问题含测试要求，给出测试用例。", prompt3,
-        max_tok=16384)
-    if not r3:
-        if verbose: print(f"FAIL3: {u3}")
-        _notify(callback, 3, "fail", {"error": u3})
-        return {"error": f"Step 3 (DeepSeek code) failed: {u3}", "step": 3}
-    if verbose:
-        print(f"\n--- STEP3 DeepSeek->代码 [{len(r3)}c, {u3.get('completion_tokens', '?')}t] ---")
-        print(r3[:400] + ("..." if len(r3) > 400 else ""))
-    out_paths.append(save_round("03_code", r3))
-    _notify(callback, 3, "done", {
-        "name": "DeepSeek code", "tokens": u3.get("completion_tokens", "?"),
-        "len": len(r3), "path": out_paths[-1]
-    })
-
-    # STEP 4: KimiCode 检验+批判+修理
-    _notify(callback, 4, "start", {"name": "KimiCode review", "model": CFG['kimi_code']['model']})
-    prompt4 = (
-        f"{history_ctx}\n"
-        f"原始需求：{q_kimi}\n\n"
-        f"待审查代码：\n{r3}\n\n"
-        "你是严格代码审查员，具备批判性思维。请对以上代码做：\n"
-        "1. 检验语法和逻辑是否完整正确；\n"
-        "2. 提出批判性质疑——对每个设计决策追问「为什么要这样做？」「有没有更好的方案？」"
-        "「如果输入极端值会怎样？」「这个假设在什么条件下不成立？」；\n"
-        "3. 直接修复发现的所有问题，输出修正后的完整代码。"
-    )
-    r4, u4 = call("kimi_code", prompt4, max_tok=8192)
-    if not r4:
-        if verbose: print(f"FAIL4: {u4}")
-        _notify(callback, 4, "fail", {"error": u4})
-        return {"error": f"Step 4 (KimiCode review) failed: {u4}", "step": 4}
-    if verbose:
-        print(f"\n--- STEP4 KimiCode->检验+批判+修理 [{len(r4)}c, {u4.get('completion_tokens', '?')}t] ---")
-        print(r4[:500] + ("..." if len(r4) > 500 else ""))
-    out_paths.append(save_round("04_review", r4))
-    _notify(callback, 4, "done", {
-        "name": "KimiCode review", "tokens": u4.get("completion_tokens", "?"),
-        "len": len(r4), "path": out_paths[-1]
-    })
-
-    # STEP 5: DeepSeek 复查批判意见，最终修改
-    _notify(callback, 5, "start", {"name": "DeepSeek final", "model": CFG['deepseek']['model']})
-    prompt5 = (
-        f"{history_ctx}\n"
-        f"当前需求：{q_full}\n\n"
-        f"审查意见与修改：\n{r4}\n\n"
-        "请逐条审视审查意见，判断哪些接受、哪些驳回（附理由），"
-        "综合所有合理建议，输出最终版完整代码。"
-    )
-    r5, u5 = call("deepseek",
-        "代码审查员提出了批判性建议和修改。请你结合历史对话，"
-        "逐条审视审查意见，判断哪些接受、哪些驳回（附理由），"
-        "综合所有合理建议，输出最终版完整代码。", prompt5,
-        max_tok=16384)
-    if not r5:
-        if verbose: print(f"FAIL5: {u5}")
-        _notify(callback, 5, "fail", {"error": u5})
-        return {"error": f"Step 5 (DeepSeek final) failed: {u5}", "step": 5}
-    if verbose:
-        print(f"\n--- STEP5 DeepSeek->复查终版 [{len(r5)}c, {u5.get('completion_tokens', '?')}t] ---")
-        print(r5[:500] + ("..." if len(r5) > 500 else ""))
-    out_paths.append(save_round("05_final", r5))
-    _notify(callback, 5, "done", {
-        "name": "DeepSeek final", "tokens": u5.get("completion_tokens", "?"),
-        "len": len(r5), "path": out_paths[-1]
-    })
-
-    dt = time.time() - t0
-    if verbose:
-        print(f"\n{'=' * 55}\n  DONE {dt:.1f}s\n{'=' * 55}")
-    return {"code": r5, "review": r4, "elapsed": round(dt, 1), "paths": out_paths}
+    p = Pipeline(callback=callback, verbose=verbose)
+    result = p.run(question, history=history, context_files=context_files)
+    return result.to_dict()
 
 
 if __name__ == "__main__":
@@ -395,16 +214,16 @@ if __name__ == "__main__":
         print("用法: python pipeline.py '<问题>'")
         sys.exit(1)
 
-    missing = []
-    for k, svc in [("KIMI_KEY", "kimi"), ("KIMI_CODE_KEY", "kimi_code"), ("DEEPSEEK_KEY", "deepseek")]:
-        if not CFG[svc]["key"]:
-            missing.append(k)
+    missing = check_missing_keys()
     if missing:
         print(f"缺少环境变量: {', '.join(missing)}")
-        print("请在 .env 文件或环境变量中设置。")
+        print("请复制 .env.example 为 .env 并填入真实 key。")
         sys.exit(2)
 
-    r = run(q)
-    if r:
-        print("\n===== FINAL CODE =====\n")
-        print(r["code"])
+    result = Pipeline().run(q)
+    if result.error:
+        print(f"\nERROR: {result.error}")
+        sys.exit(3)
+
+    print("\n===== FINAL CODE =====\n")
+    print(result.code)

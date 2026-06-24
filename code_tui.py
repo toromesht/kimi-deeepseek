@@ -29,11 +29,12 @@ import pipeline
 console = Console()
 
 STEP_NAMES = {
-    1: ("Kimi", "生成提示词"),
-    2: ("KimiCode", "写代码框架"),
-    3: ("DeepSeek", "写完整代码"),
-    4: ("KimiCode", "批判性审查 + 修复"),
-    5: ("DeepSeek", "复查输出终版"),
+    "planner": ("Kimi", "架构与提示词"),
+    "coder": ("DeepSeek", "生成完整代码"),
+    "critic": ("KimiCode", "批判性审查"),
+    "validator": ("DeepSeek", "静态 + LLM 验证"),
+    "repairer": ("DeepSeek", "修复输出终版"),
+    "ultra": ("DeepSeek", "单模型强输出"),
 }
 
 
@@ -62,9 +63,9 @@ def make_progress_table(status=None):
     table.add_column("状态", style="yellow")
     table.add_column("Token / 长度", justify="right", style="dim")
 
-    for i in range(1, 6):
-        model, task = STEP_NAMES[i]
-        st = status.get(i, {})
+    for key in STEP_NAMES:
+        model, task = STEP_NAMES[key]
+        st = status.get(key, {})
         if st.get("status") == "start":
             state = "[bold yellow]⏳ 运行中...[/bold yellow]"
         elif st.get("status") == "done":
